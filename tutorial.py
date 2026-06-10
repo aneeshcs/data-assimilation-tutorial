@@ -444,11 +444,11 @@ def _(mo):
 
         where $\mathbf{x}_k = \mathcal{M}_{0 \to t_k}(\mathbf{x}_0)$.
 
-        **Gradient** requires the **adjoint model** $\mathcal{M}^*$ (backward integration):
+        **Gradient** requires the **adjoint model** $\mathcal{M}^{\ast}$ (backward integration):
 
         $$
-        \nabla_{\mathbf{x}_0}\mathcal{J} = \mathbf{B}^{-1}(\mathbf{x}_0 - \mathbf{x}_0^b)
-        + \mathcal{M}^*_{t_N \to t_0}\left[
+        \nabla_{\mathbf{x}_0}\mathcal{J} = \mathbf{B}^{-1}(\mathbf{x}_0 - \mathbf{x}_0^b) +
+        \mathcal{M}^{\ast}_{t_N \to t_0}\left[
         \sum_k H^T \mathbf{R}^{-1}(\mathbf{y}_k - H\mathbf{x}_k)\delta(t - t_k)
         \right]
         $$
