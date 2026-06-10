@@ -1,10 +1,7 @@
 import marimo
 
 __generated_with = "0.23.9"
-app = marimo.App(
-    width="medium",
-    title="Data Assimilation Tutorial: 3DVAR, 4DVAR, and EnKF on Lorenz 63",
-)
+app = marimo.App(width="medium")
 
 
 @app.cell(hide_code=True)
@@ -116,6 +113,10 @@ def _(np, solve_ivp):
     def integrate_l63(
         x0, t_span, t_eval=None, sigma=10.0, rho=28.0, beta=8.0 / 3.0
     ):
+        # Clip t_eval to t_span to guard against floating-point overshoot
+        if t_eval is not None:
+            mask   = (t_eval >= t_span[0] - 1e-10) & (t_eval <= t_span[1] + 1e-10)
+            t_eval = np.clip(t_eval[mask], t_span[0], t_span[1])
         sol = solve_ivp(
             lorenz63,
             t_span,
@@ -204,14 +205,14 @@ def _(integrate_l63, np, rng):
     BG_SIGMA  = 3.0           # background error std (each component)
 
     # ── Spin-up: land on the attractor ────────────────────────────────────
-    t_spinup = np.arange(0, T_SPINUP, DT_MODEL)
+    t_spinup = np.linspace(0, T_SPINUP, int(round(T_SPINUP / DT_MODEL)) + 1)
     x0_truth = np.array([1.0, 1.0, 20.0])
     spinup   = integrate_l63(x0_truth, (0, T_SPINUP), t_spinup)
     x_start  = spinup[-1]  # point on attractor
 
     # ── Nature run (truth) ────────────────────────────────────────────────
-    t_assim  = np.arange(0, T_ASSIM + DT_MODEL, DT_MODEL)
-    n_steps  = len(t_assim)
+    n_steps  = int(round(T_ASSIM / DT_MODEL)) + 1
+    t_assim  = np.linspace(0, T_ASSIM, n_steps)
     truth    = integrate_l63(x_start, (0, T_ASSIM), t_assim)  # (n_steps, 3)
 
     # ── Synthetic observations ─────────────────────────────────────────────
@@ -332,8 +333,9 @@ def _(B, B_inv, DT_MODEL, R_inv, integrate_l63, np, obs_times_idx, observations,
 
             # Forecast to obs time (except at k=0 we are already there)
             if k > 0:
-                t_seg   = np.arange(0, t_end - t_start + dt, dt)
-                segment = integrate_l63(x_curr, (0, t_end - t_start), t_seg)
+                _dt_seg = t_end - t_start
+                t_seg   = np.linspace(0, _dt_seg, max(2, int(round(_dt_seg / dt)) + 1))
+                segment = integrate_l63(x_curr, (0, _dt_seg), t_seg)
                 fcst_traj.append((t_start, t_end, t_seg, segment))
                 x_curr  = segment[-1]
 
@@ -362,8 +364,9 @@ def _(B, B_inv, DT_MODEL, R_inv, integrate_l63, np, obs_times_idx, observations,
     for _k in range(len(analyses_3dvar) - 1):
         _t0, _xa = analyses_3dvar[_k]
         _t1, _   = analyses_3dvar[_k + 1]
-        _seg_t   = np.arange(0, _t1 - _t0 + DT_MODEL, DT_MODEL)
-        _seg     = integrate_l63(_xa, (0, _t1 - _t0), _seg_t)
+        _ddt     = _t1 - _t0
+        _seg_t   = np.linspace(0, _ddt, max(2, int(round(_ddt / DT_MODEL)) + 1))
+        _seg     = integrate_l63(_xa, (0, _ddt), _seg_t)
         _i0      = obs_times_idx[_k]
         _i1      = obs_times_idx[_k + 1]
         _n       = min(len(_seg), _i1 - _i0 + 1)
@@ -466,6 +469,10 @@ def _(mo):
 
 @app.cell
 def _(B_inv, DT_MODEL, R_inv, integrate_l63, np, obs_times_idx, observations, t_assim, truth, x_bg):
+    def _linspace_seg(t_end, dt):
+        n = max(2, int(round(t_end / dt)) + 1)
+        return np.linspace(0.0, t_end, n)
+
     def var4d_cost_and_grad(x0, xb, B_inv, obs_window, obs_idx_window, t_grid, dt, R_inv, eps=1e-5):
         """
         4DVAR cost J and gradient ∇J w.r.t. x0.
@@ -473,25 +480,31 @@ def _(B_inv, DT_MODEL, R_inv, integrate_l63, np, obs_times_idx, observations, t_
         """
         H = np.eye(3)
         n = len(x0)
-        n_obs_w = len(obs_idx_window)
 
         def _J(x0_):
-            # Propagate x0_ to all observation times in the window
             t_end = t_grid[obs_idx_window[-1]]
-            t_seg = np.arange(0, t_end + dt, dt)
-            traj  = integrate_l63(x0_, (0, t_end), t_seg)
-            Jb    = 0.5 * (x0_ - xb) @ B_inv @ (x0_ - xb)
-            Jo    = 0.0
-            for k, idx in enumerate(obs_idx_window):
-                local_idx = min(idx, len(traj) - 1)
-                innov = obs_window[k] - H @ traj[local_idx]
-                Jo   += 0.5 * innov @ R_inv @ innov
+            Jb = 0.5 * (x0_ - xb) @ B_inv @ (x0_ - xb)
+            Jo = 0.0
+            if t_end < dt * 0.5:
+                # Degenerate single-obs window at t=0: no model propagation needed
+                for k, idx in enumerate(obs_idx_window):
+                    innov = obs_window[k] - H @ x0_
+                    Jo   += 0.5 * innov @ R_inv @ innov
+            else:
+                t_seg = _linspace_seg(t_end, dt)
+                traj  = integrate_l63(x0_, (0.0, t_end), t_seg)
+                for k, idx in enumerate(obs_idx_window):
+                    # map obs time to nearest traj index
+                    ti = t_grid[idx]
+                    li = min(int(round(ti / dt)), len(traj) - 1)
+                    innov = obs_window[k] - H @ traj[li]
+                    Jo   += 0.5 * innov @ R_inv @ innov
             return Jb + Jo
 
         J0 = _J(x0)
         grad = np.zeros(n)
         for _j in range(n):
-            x_p     = x0.copy(); x_p[_j] += eps
+            x_p      = x0.copy(); x_p[_j] += eps
             grad[_j] = (_J(x_p) - J0) / eps
         return J0, grad
 
@@ -500,20 +513,17 @@ def _(B_inv, DT_MODEL, R_inv, integrate_l63, np, obs_times_idx, observations, t_
         Cycling 4DVAR: assimilate 'window_size' observations at a time,
         then advance the analysis to the start of the next window.
         """
-        H        = np.eye(3)
         x_curr   = xb.copy()
         analyses = []
         n_obs    = len(obs_idx)
 
         for k in range(0, n_obs, window_size):
-            win_end = min(k + window_size, n_obs)
+            win_end     = min(k + window_size, n_obs)
             win_obs_idx = obs_idx[k:win_end] - obs_idx[k]   # relative indices
             win_obs     = obs_seq[k:win_end]
             t_start     = t_grid[obs_idx[k]]
-
-            # Relative time grid for this window
-            t_win_end = t_grid[obs_idx[win_end - 1]] - t_start
-            t_win     = np.arange(0, t_win_end + dt, dt)
+            t_win_end   = t_grid[obs_idx[win_end - 1]] - t_start
+            t_win       = _linspace_seg(t_win_end, dt)
 
             res = minimize(
                 var4d_cost_and_grad,
@@ -529,8 +539,7 @@ def _(B_inv, DT_MODEL, R_inv, integrate_l63, np, obs_times_idx, observations, t_
             # Propagate to end of window → becomes background for next
             if win_end < n_obs:
                 t_advance = t_grid[obs_idx[win_end]] - t_start
-                t_adv     = np.arange(0, t_advance + dt, dt)
-                seg       = integrate_l63(x0_opt, (0, t_advance), t_adv)
+                seg       = integrate_l63(x0_opt, (0.0, t_advance), _linspace_seg(t_advance, dt))
                 x_curr    = seg[-1]
 
         return analyses
@@ -545,10 +554,10 @@ def _(B_inv, DT_MODEL, R_inv, integrate_l63, np, obs_times_idx, observations, t_
     for _k in range(len(analyses_4dvar) - 1):
         _t0, _xa = analyses_4dvar[_k]
         _t1, _   = analyses_4dvar[_k + 1]
-        _seg_t   = np.arange(0, _t1 - _t0 + DT_MODEL, DT_MODEL)
-        _seg     = integrate_l63(_xa, (0, _t1 - _t0), _seg_t)
-        _i0      = int(_t0 / DT_MODEL)
-        _n       = min(len(_seg), int((_t1 - _t0) / DT_MODEL) + 1)
+        _dt      = _t1 - _t0
+        _seg     = integrate_l63(_xa, (0.0, _dt), _linspace_seg(_dt, DT_MODEL))
+        _i0      = int(round(_t0 / DT_MODEL))
+        _n       = min(len(_seg), int(round(_dt / DT_MODEL)) + 1)
         traj_4dvar[_i0:_i0 + _n] = _seg[:_n]
 
     rmse_4dvar = np.sqrt(np.mean(
